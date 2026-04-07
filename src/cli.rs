@@ -1,5 +1,5 @@
 ////////////////////////////////////////////////////////////
-// IPrangeRetriever - A tool for retrieving IP ranges, ASNs, and IP ownership details
+// NetOrigin - A tool for retrieving IP ranges, ASNs, and IP ownership details
 // Command-line option parser
 //
 // Copyright (c) 2026 All rights reserved.

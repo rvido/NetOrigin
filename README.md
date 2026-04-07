@@ -1,6 +1,6 @@
-# ipranges
+# NetOrigin
 
-`ipranges` is a small Rust CLI for retrieving network ownership data and IP ranges.
+`NetOrigin` is a small Rust CLI for retrieving network ownership data and IP ranges.
 
 It supports:
 
