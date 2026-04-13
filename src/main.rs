@@ -6,7 +6,8 @@
 ////////////////////////////////////////////////////////////
 
 mod cli;
-mod ipranges;
+
+use netorigin::ipranges;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = cli::parse_args();

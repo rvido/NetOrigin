@@ -116,7 +116,7 @@ struct IpInfoLiteLookupResponse {
 /// # Example
 /// ```
 /// use ipnet::{IpNet, Ipv4Net, Ipv6Net};
-/// use ipranges::from_ipnet;
+/// use netorigin::ipranges::from_ipnet;
 ///
 /// let mixed_nets = vec!["192.0.2.0/24".parse::<Ipv4Net>().unwrap().into(), "2001:db8::/32".parse::<Ipv6Net>().unwrap().into()];
 /// let (ipv4_range, ipv6_range) = from_ipnet(&mixed_nets);
@@ -160,7 +160,7 @@ pub fn from_ipnet(ipnets: &[IpNet]) -> (IpRange<Ipv4Net>, IpRange<Ipv6Net>) {
 /// # Example
 /// ```
 /// use ipnet::{IpNet, Ipv4Net, Ipv6Net};
-/// use ipranges::to_ipnet;
+/// use netorigin::ipranges::to_ipnet;
 ///
 /// let ipv4s = vec!["192.0.2.0/24".parse::<Ipv4Net>().unwrap()];
 /// let ipv6s = vec!["2001:db8::/32".parse::<Ipv6Net>().unwrap()];
@@ -201,7 +201,7 @@ pub fn to_ipnet(ipv4_nets: &[Ipv4Net], ipv6_nets: &[Ipv6Net]) -> Vec<IpNet> {
 ///
 /// # Example
 /// ```no_run
-/// use ipranges::get_as_numbers_of;
+/// use netorigin::ipranges::get_as_numbers_of;
 ///
 /// let as_numbers = get_as_numbers_of("telegram").unwrap();
 /// println!("Telegram AS numbers: {:?}", as_numbers);
@@ -350,7 +350,7 @@ pub fn get_ip_ranges_of(company: &str) -> Result<Vec<IpNet>, Box<dyn std::error:
 ///
 /// # Example
 /// ```no_run
-/// use ipranges;
+/// use netorigin::ipranges;
 ///
 /// if let Ok((ipv4_ranges, ipv6_ranges)) = ipranges::get_google_ip_ranges() {
 ///     println!("Found {} IPv4 and {} IPv6 ranges for Google services.",
