@@ -1,6 +1,11 @@
 # NetOrigin
 
-`NetOrigin` is a small Rust CLI for retrieving network ownership data and IP ranges.
+`NetOrigin` is a small Rust project for retrieving network ownership data and IP ranges.
+
+It can be used as:
+
+- A CLI tool
+- A reusable library crate (`netorigin::ipranges`)
 
 It supports:
 
@@ -55,6 +60,33 @@ Name: Google LLC
 Domain: google.com
 ```
 
+## Library Usage
+
+`NetOrigin` also exposes IP range functionality through a library module.
+
+```rust
+use netorigin::ipranges;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+	let as_numbers = ipranges::get_as_numbers_of("telegram")?;
+	println!("Found {} AS numbers", as_numbers.len());
+
+	let ip_ranges = ipranges::get_ip_ranges_for_asn("AS15169")?;
+	println!("Found {} IP ranges", ip_ranges.len());
+
+	Ok(())
+}
+```
+
+Available library entry points include:
+
+- `get_google_ip_ranges`
+- `get_as_numbers_of`
+- `get_ip_ranges_of`
+- `get_ip_ranges_for_asn`
+- `lookup_ipinfo`
+- `from_ipnet` / `to_ipnet`
+
 ## Notes
 
 - The `--company`, `--asn`, and `--google` flows rely on public third-party endpoints and page structure.
@@ -63,6 +95,7 @@ Domain: google.com
 
 ## Project Structure
 
+- `src/lib.rs`: library entry point that exports `ipranges`
 - `src/cli.rs`: CLI argument parsing with `clap`
 - `src/main.rs`: command dispatch and terminal output
 - `src/ipranges.rs`: HTTP requests, scraping, IP range aggregation, and IPinfo lookup logic
