@@ -20,7 +20,6 @@ use clap::{ArgGroup, Parser};
         .required(true)
         .args(["google", "company", "asn", "ip"]),
 ))]
-
 pub struct Args {
     /// Use Google as the target
     #[arg(long)]

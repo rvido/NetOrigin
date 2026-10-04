@@ -10,9 +10,13 @@ use iprange::IpRange;
 use rayon::ThreadPoolBuilder;
 use rayon::prelude::*;
 use reqwest::blocking::Client;
+use reqwest::{StatusCode, Url};
 use scraper::{Html, Selector};
 use serde::Deserialize;
+use std::collections::HashSet;
 use std::env;
+use std::net::IpAddr;
+use std::sync::LazyLock;
 use std::time::Duration;
 
 /// ==============================================================================
@@ -27,15 +31,25 @@ const URL_GOOGLE_CLOUD: &str = "https://www.gstatic.com/ipranges/cloud.json";
 const URL_IPINFO_LOOKUP: &str = "https://api.ipinfo.io/lookup";
 const URL_IPINFO_LITE: &str = "https://api.ipinfo.io/lite";
 const IPINFO_TOKEN_ENV: &str = "IPINFO_TOKEN";
+/// Hurricane Electric BGP toolkit (company search and AS pages):
+const URL_BGP_HE: &str = "https://bgp.he.net";
 /// Configuration for HTTP client and scraping behavior:
 const MAX_AS_FETCH_THREADS: usize = 4;
-const REQUEST_TIMEOUT: u64 = 10; // Seconds
+// Some bgp.he.net search pages take more than 10 seconds to render, so allow a longer
+// total time, but give up quickly on hosts that do not answer at all.
+const REQUEST_TIMEOUT: u64 = 30; // Seconds
+const CONNECT_TIMEOUT: u64 = 10; // Seconds
 const REQUEST_RETRY_INTERVAL: usize = 10;
 const REQUEST_DELAY_INTERVAL: u64 = 1; // Seconds
 
 // Some websites look for a valid web-browser user-agent
 // This string can be retrievd when typing 'what's my user agent' into Google search bar
 const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64; rv:148.0) Gecko/20100101 Firefox/148.0";
+
+/// AS numbers and prefixes on `bgp.he.net` are links inside table cells.
+/// Parsed once and shared by all threads.
+static TABLE_LINK_SELECTOR: LazyLock<Selector> =
+    LazyLock::new(|| Selector::parse("td a").expect("'td a' is a valid CSS selector"));
 
 #[derive(Deserialize)]
 struct Prefix {
@@ -51,7 +65,7 @@ struct GoogleIpRangeResponse {
     prefixes: Vec<Prefix>,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct IpInfoAsnResponse {
     pub asn: String,
     #[serde(default)]
@@ -64,7 +78,7 @@ pub struct IpInfoAsnResponse {
     pub asn_type: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct IpInfoLookupResponse {
     pub ip: String,
     #[serde(rename = "as", default)]
@@ -187,7 +201,8 @@ pub fn to_ipnet(ipv4_nets: &[Ipv4Net], ipv6_nets: &[Ipv6Net]) -> Vec<IpNet> {
 /// ```text
 /// https://bgp.he.net/search?search[search]={company}&commit=Search
 /// ```
-/// It parses the HTML response to extract strings starting with "AS" (e.g., "AS12345").
+/// It parses the HTML response to extract AS numbers (e.g., "AS12345"). Duplicates are removed
+/// while keeping the order of the search results.
 ///
 /// # Arguments
 ///
@@ -207,9 +222,9 @@ pub fn to_ipnet(ipv4_nets: &[Ipv4Net], ipv6_nets: &[Ipv6Net]) -> Vec<IpNet> {
 /// println!("Telegram AS numbers: {:?}", as_numbers);
 /// ```
 pub fn get_as_numbers_of(company: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-    let url = format!("https://bgp.he.net/search?search[search]={company}&commit=Search");
+    let url = company_search_url(company)?;
     let client = build_http_client(REQUEST_TIMEOUT, USER_AGENT)?;
-    get_as_numbers_from_url(&client, &url)
+    get_as_numbers_from_url(&client, url.as_str())
 }
 
 /// Retrieves all IP prefixes announced by a single Autonomous System.
@@ -226,27 +241,12 @@ pub fn get_as_numbers_of(company: &str) -> Result<Vec<String>, Box<dyn std::erro
 /// A `Result<Vec<IpNet>, Box<dyn std::error::Error>>` containing all announced prefixes
 /// (both IPv4 and IPv6), simplified and sorted.
 pub fn get_ip_ranges_for_asn(asn: &str) -> Result<Vec<IpNet>, Box<dyn std::error::Error>> {
-    // Normalize: accept "AS12345" or "12345", always produce "AS12345".
-    let canonical = if asn.get(..2).is_some_and(|p| p.eq_ignore_ascii_case("AS")) {
-        format!("AS{}", &asn[2..])
-    } else {
-        format!("AS{asn}")
-    };
-
+    let canonical = canonical_asn(asn)?;
     let client = build_http_client(REQUEST_TIMEOUT, USER_AGENT)?;
-    let url = format!("https://bgp.he.net/{canonical}");
+    let url = format!("{URL_BGP_HE}/{canonical}");
     let all_ipnets = get_ipranges_from_url(&client, &url)?;
 
-    let (mut ipv4_nets, mut ipv6_nets) = from_ipnet(&all_ipnets);
-    ipv4_nets.simplify();
-    ipv6_nets.simplify();
-
-    let mut ipv4nets = ipv4_nets.iter().collect::<Vec<_>>();
-    let mut ipv6nets = ipv6_nets.iter().collect::<Vec<_>>();
-    ipv4nets.sort();
-    ipv6nets.sort();
-
-    Ok(to_ipnet(&ipv4nets, &ipv6nets))
+    Ok(aggregate_ipnets(all_ipnets))
 }
 
 /// Looks up IP ownership data through the IPinfo API.
@@ -255,10 +255,16 @@ pub fn get_ip_ranges_for_asn(asn: &str) -> Result<Vec<IpNet>, Box<dyn std::error
 /// This lookup returns structured ASN data for a single IP address and is intended
 /// as an alternative provider-backed capability alongside the existing scraping-based flows.
 pub fn lookup_ipinfo(ip: &str) -> Result<IpInfoLookupResponse, Box<dyn std::error::Error>> {
+    let ip: IpAddr = ip
+        .trim()
+        .parse()
+        .map_err(|_| format!("'{ip}' is not a valid IPv4 or IPv6 address"))?;
     let token = env::var(IPINFO_TOKEN_ENV)
-        .map_err(|_| format!("{IPINFO_TOKEN_ENV} environment variable is not set"))?;
+        .ok()
+        .filter(|token| !token.trim().is_empty())
+        .ok_or_else(|| format!("{IPINFO_TOKEN_ENV} environment variable is not set"))?;
     let client = build_http_client(REQUEST_TIMEOUT, USER_AGENT)?;
-    let response = request_ipinfo_with_fallback(&client, ip, &token)?;
+    let response = request_ipinfo_with_fallback(&client, ip, token.trim())?;
 
     parse_ipinfo_lookup_response(&response)
 }
@@ -283,52 +289,32 @@ pub fn lookup_ipinfo(ip: &str) -> Result<IpInfoLookupResponse, Box<dyn std::erro
 /// - `Err(Box<dyn std::error::Error>)`: An error object if any of the web scraping or parsing
 ///   operations fail.
 pub fn get_ip_ranges_of(company: &str) -> Result<Vec<IpNet>, Box<dyn std::error::Error>> {
+    let url = company_search_url(company)?;
     let client = build_http_client(REQUEST_TIMEOUT, USER_AGENT)?;
 
     // First, get the AS numbers associated with the given company.
-    let asnums = get_as_numbers_from_url(
-        &client,
-        &format!("https://bgp.he.net/search?search[search]={company}&commit=Search"),
-    )?;
+    let asnums = get_as_numbers_from_url(&client, url.as_str())?;
+    if asnums.is_empty() {
+        return Ok(Vec::new());
+    }
 
     // Fetch prefixes from each AS page in parallel.
     let pool = ThreadPoolBuilder::new()
-        .num_threads(MAX_AS_FETCH_THREADS)
+        .num_threads(MAX_AS_FETCH_THREADS.min(asnums.len()))
         .build()?;
 
     let fetched = pool.install(|| {
         asnums
             .par_iter()
             .map(|asnum| {
-                let url = format!("https://bgp.he.net/{asnum}");
+                let url = format!("{URL_BGP_HE}/{asnum}");
                 get_ipranges_from_url(&client, &url).map_err(|err| format!("{asnum}: {err}"))
             })
-            .collect::<Vec<_>>()
-    });
+            .collect::<Result<Vec<_>, _>>()
+    })?;
 
-    let mut all_ipnets: Vec<IpNet> = Vec::new();
-    for result in fetched {
-        match result {
-            Ok(ipnets) => all_ipnets.extend(ipnets),
-            Err(err) => return Err(err.into()),
-        }
-    }
-
-    // Split up into separate IPv4 and IPv6 ranges and simplify them (combine ranges if possible)
-    let (mut ipv4_nets, mut ipv6_nets) = from_ipnet(&all_ipnets);
-
-    // Combine adjacent or overlapping IP ranges
-    ipv4_nets.simplify();
-    ipv6_nets.simplify();
-
-    // Collect and sort the final IP networks
-    let mut ipv4nets = ipv4_nets.iter().collect::<Vec<_>>();
-    let mut ipv6nets = ipv6_nets.iter().collect::<Vec<_>>();
-    ipv4nets.sort();
-    ipv6nets.sort();
-
-    // Return the final IP networks
-    Ok(to_ipnet(&ipv4nets, &ipv6nets))
+    // Combine adjacent or overlapping IP ranges, then sort them
+    Ok(aggregate_ipnets(fetched.into_iter().flatten()))
 }
 
 /// Retrieves Google's non-cloud service IP ranges.
@@ -360,27 +346,24 @@ pub fn get_ip_ranges_of(company: &str) -> Result<Vec<IpNet>, Box<dyn std::error:
 /// }
 /// ```
 pub fn get_google_ip_ranges() -> Result<(Vec<Ipv4Net>, Vec<Ipv6Net>), Box<dyn std::error::Error>> {
-    let google_client = build_http_client(REQUEST_TIMEOUT, USER_AGENT)?;
-    let cloud_client = build_http_client(REQUEST_TIMEOUT, USER_AGENT)?;
-    let pool = ThreadPoolBuilder::new().num_threads(2).build()?;
+    let client = build_http_client(REQUEST_TIMEOUT, USER_AGENT)?;
 
-    let (google_response, cloud_response) = pool.install(|| {
-        rayon::join(
-            || {
-                request_ip_range_list(&google_client, URL_GOOGLE_IPS)
-                    .map_err(|err| format!("google ip ranges: {err}"))
-            },
-            || {
-                request_ip_range_list(&cloud_client, URL_GOOGLE_CLOUD)
-                    .map_err(|err| format!("google cloud ip ranges: {err}"))
-            },
-        )
+    // Both feeds are independent, so fetch them at the same time.
+    let (google_response, cloud_response) = std::thread::scope(|scope| {
+        let cloud = scope.spawn(|| {
+            request_ip_range_list(&client, URL_GOOGLE_CLOUD)
+                .map_err(|err| format!("google cloud ip ranges: {err}"))
+        });
+        let google = request_ip_range_list(&client, URL_GOOGLE_IPS)
+            .map_err(|err| format!("google ip ranges: {err}"));
+        let cloud = cloud
+            .join()
+            .unwrap_or_else(|_| Err("google cloud ip ranges: fetch thread panicked".to_string()));
+        (google, cloud)
     });
 
-    let (mut goog_ip4, mut goog_ip6) =
-        to_iprange(&google_response.map_err(|err| -> Box<dyn std::error::Error> { err.into() })?);
-    let (cloud_ip4, cloud_ip6) =
-        to_iprange(&cloud_response.map_err(|err| -> Box<dyn std::error::Error> { err.into() })?);
+    let (mut goog_ip4, mut goog_ip6) = to_iprange(&google_response?)?;
+    let (cloud_ip4, cloud_ip6) = to_iprange(&cloud_response?)?;
 
     cloud_ip4.iter().for_each(|ip4| {
         goog_ip4.remove(ip4);
@@ -389,22 +372,13 @@ pub fn get_google_ip_ranges() -> Result<(Vec<Ipv4Net>, Vec<Ipv6Net>), Box<dyn st
         goog_ip6.remove(ip6);
     });
 
-    goog_ip4.simplify();
-    goog_ip6.simplify();
-
-    let mut ipv4nets = goog_ip4.iter().collect::<Vec<_>>();
-    let mut ipv6nets = goog_ip6.iter().collect::<Vec<_>>();
-
-    ipv4nets.sort();
-    ipv6nets.sort();
-
-    Ok((ipv4nets, ipv6nets))
+    Ok(simplify_and_sort(goog_ip4, goog_ip6))
 }
 
 ///////////////////////////////////////////////////////////////////////////////
-///
-/// Helper function to perform HTTP GET request and parse the JSON response
-///
+//
+// Helper function to perform HTTP GET request and parse the JSON response
+//
 ///////////////////////////////////////////////////////////////////////////////
 
 #[inline]
@@ -448,27 +422,32 @@ fn parse_ipinfo_lookup_response(
         return Ok(mapped);
     }
 
-    let core: IpInfoLookupResponse = serde_json::from_str(response)?;
+    let core: IpInfoLookupResponse = serde_json::from_value(value)?;
     Ok(core)
 }
 
 #[inline]
 fn request_ipinfo_with_fallback(
     client: &Client,
-    ip: &str,
+    ip: IpAddr,
     token: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let core_url = format!("{URL_IPINFO_LOOKUP}/{ip}?token={token}");
-    let core_response = client.get(core_url).send()?;
+    // Send the token as a header, not in the URL, so it never shows up in error messages.
+    let core_response = client
+        .get(format!("{URL_IPINFO_LOOKUP}/{ip}"))
+        .bearer_auth(token)
+        .send()?;
 
     if core_response.status().is_success() {
         return core_response.text().map_err(Into::into);
     }
 
     // Lite tokens can be rejected by /lookup. Fall back to the Lite endpoint.
-    if core_response.status().as_u16() == 403 {
-        let lite_url = format!("{URL_IPINFO_LITE}/{ip}?token={token}");
-        let lite_response = client.get(lite_url).send()?;
+    if core_response.status() == StatusCode::FORBIDDEN {
+        let lite_response = client
+            .get(format!("{URL_IPINFO_LITE}/{ip}"))
+            .bearer_auth(token)
+            .send()?;
 
         if lite_response.status().is_success() {
             return lite_response.text().map_err(Into::into);
@@ -486,28 +465,108 @@ fn request_ipinfo_with_fallback(
 
 /// Returns a tuple containing Ipv4 and Ipv6 addresses ranges
 #[inline]
-fn to_iprange(response: &GoogleIpRangeResponse) -> (IpRange<Ipv4Net>, IpRange<Ipv6Net>) {
-    let mut ip4_cidrs: Vec<String> = Vec::new();
-    let mut ip6_cidrs: Vec<String> = Vec::new();
+fn to_iprange(
+    response: &GoogleIpRangeResponse,
+) -> Result<(IpRange<Ipv4Net>, IpRange<Ipv6Net>), Box<dyn std::error::Error>> {
+    let mut ipv4nets = IpRange::new();
+    let mut ipv6nets = IpRange::new();
 
     for prefix in response.prefixes.iter() {
         if let Some(ipv4) = &prefix.ipv4_prefix {
-            ip4_cidrs.push(ipv4.to_owned())
-        } else if let Some(ipv6) = &prefix.ipv6_prefix {
-            ip6_cidrs.push(ipv6.to_owned())
+            let net: Ipv4Net = ipv4
+                .trim()
+                .parse()
+                .map_err(|err| format!("invalid IPv4 prefix '{ipv4}': {err}"))?;
+            ipv4nets.add(net);
+        }
+        if let Some(ipv6) = &prefix.ipv6_prefix {
+            let net: Ipv6Net = ipv6
+                .trim()
+                .parse()
+                .map_err(|err| format!("invalid IPv6 prefix '{ipv6}': {err}"))?;
+            ipv6nets.add(net);
         }
     }
 
-    let ipv4nets: IpRange<Ipv4Net> = ip4_cidrs
-        .iter()
-        .map(|x| x.parse().expect("Should be a valid IPv4 CIDR format"))
-        .collect();
-    let ipv6nets: IpRange<Ipv6Net> = ip6_cidrs
-        .iter()
-        .map(|x| x.parse().expect("Should be a valid IPv6 CIDR format"))
-        .collect();
+    Ok((ipv4nets, ipv6nets))
+}
+
+/// Merges adjacent or overlapping prefixes and returns them sorted.
+#[inline]
+fn simplify_and_sort(
+    mut ipv4: IpRange<Ipv4Net>,
+    mut ipv6: IpRange<Ipv6Net>,
+) -> (Vec<Ipv4Net>, Vec<Ipv6Net>) {
+    ipv4.simplify();
+    ipv6.simplify();
+
+    let mut ipv4nets = ipv4.iter().collect::<Vec<_>>();
+    let mut ipv6nets = ipv6.iter().collect::<Vec<_>>();
+    ipv4nets.sort_unstable();
+    ipv6nets.sort_unstable();
 
     (ipv4nets, ipv6nets)
+}
+
+/// Simplifies a mixed list of prefixes: IPv4 first, then IPv6, each sorted.
+#[inline]
+fn aggregate_ipnets(ipnets: impl IntoIterator<Item = IpNet>) -> Vec<IpNet> {
+    let mut ipv4 = IpRange::new();
+    let mut ipv6 = IpRange::new();
+
+    for ipnet in ipnets {
+        match ipnet {
+            IpNet::V4(net) => {
+                ipv4.add(net);
+            }
+            IpNet::V6(net) => {
+                ipv6.add(net);
+            }
+        }
+    }
+
+    let (ipv4nets, ipv6nets) = simplify_and_sort(ipv4, ipv6);
+    to_ipnet(&ipv4nets, &ipv6nets)
+}
+
+/// Builds the `bgp.he.net` search URL with the company name safely URL-encoded.
+#[inline]
+fn company_search_url(company: &str) -> Result<Url, Box<dyn std::error::Error>> {
+    let company = company.trim();
+    if company.is_empty() {
+        return Err("company name must not be empty".into());
+    }
+
+    Url::parse_with_params(
+        &format!("{URL_BGP_HE}/search"),
+        &[("search[search]", company), ("commit", "Search")],
+    )
+    .map_err(Into::into)
+}
+
+/// Accepts `"AS12345"`, `"as12345"` or `"12345"` and returns `"AS12345"`.
+#[inline]
+fn canonical_asn(asn: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let trimmed = asn.trim();
+    let digits = match trimmed.get(..2) {
+        Some(prefix) if prefix.eq_ignore_ascii_case("AS") => &trimmed[2..],
+        _ => trimmed,
+    };
+
+    match digits.parse::<u32>() {
+        Ok(number) if digits.bytes().all(|b| b.is_ascii_digit()) => Ok(format!("AS{number}")),
+        _ => {
+            Err(format!("'{asn}' is not a valid AS number (expected e.g. AS12345 or 12345)").into())
+        }
+    }
+}
+
+/// Returns `true` for strings like `"AS12345"`.
+#[inline]
+fn is_as_number(entry: &str) -> bool {
+    entry
+        .strip_prefix("AS")
+        .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
 }
 
 #[inline]
@@ -515,12 +574,18 @@ fn get_as_numbers_from_url(
     client: &Client,
     url: &str,
 ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-    let scraped_asnums = scrape_website(client, url, "td a")?;
-    let asnums = scraped_asnums
+    let scraped = scrape_website(client, url, &TABLE_LINK_SELECTOR)?;
+    Ok(unique_as_numbers(scraped))
+}
+
+/// Keeps only AS numbers and drops duplicates, keeping the first-seen order.
+#[inline]
+fn unique_as_numbers(entries: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    entries
         .into_iter()
-        .filter(|entry| entry.starts_with("AS"))
-        .collect::<Vec<String>>();
-    Ok(asnums)
+        .filter(|entry| is_as_number(entry) && seen.insert(entry.clone()))
+        .collect()
 }
 
 #[inline]
@@ -528,7 +593,7 @@ fn get_ipranges_from_url(
     client: &Client,
     url: &str,
 ) -> Result<Vec<IpNet>, Box<dyn std::error::Error>> {
-    let scraped_prefixes = scrape_website(client, url, "td a")?;
+    let scraped_prefixes = scrape_website(client, url, &TABLE_LINK_SELECTOR)?;
     let ipnets = scraped_prefixes
         .into_iter()
         .filter_map(|ip| ip.parse::<IpNet>().ok())
@@ -540,6 +605,7 @@ fn get_ipranges_from_url(
 fn build_http_client(timeout: u64, user_agent: &str) -> Result<Client, Box<dyn std::error::Error>> {
     Client::builder()
         .user_agent(user_agent)
+        .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT))
         .timeout(Duration::from_secs(timeout))
         .build()
         .map_err(Into::into)
@@ -554,18 +620,28 @@ fn get_html_content(client: &Client, url: &str) -> Result<String, Box<dyn std::e
 fn scrape_website(
     client: &Client,
     url: &str,
-    html_selectors: &str,
+    selector: &Selector,
 ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
     let html_content = get_html_content(client, url)?;
-    let document = Html::parse_document(&html_content);
-    let html_sel = Selector::parse(html_selectors).map_err(|e| e.to_string())?;
+    Ok(extract_texts(&html_content, selector))
+}
 
-    let content = document
-        .select(&html_sel)
-        .map(|e| e.inner_html())
-        .collect::<Vec<_>>();
+/// Returns the trimmed text of every element that matches `selector`.
+#[inline]
+fn extract_texts(html: &str, selector: &Selector) -> Vec<String> {
+    Html::parse_document(html)
+        .select(selector)
+        .map(|e| e.text().collect::<String>().trim().to_owned())
+        .filter(|text| !text.is_empty())
+        .collect()
+}
 
-    Ok(content)
+/// `429 Too Many Requests` and `408 Request Timeout` are temporary, so they are retried.
+#[inline]
+fn is_retryable_status(status: StatusCode) -> bool {
+    status.is_server_error()
+        || status == StatusCode::TOO_MANY_REQUESTS
+        || status == StatusCode::REQUEST_TIMEOUT
 }
 
 #[inline]
@@ -575,33 +651,36 @@ fn http_get_retry_timeout(
     retry: usize,
     delay: u64,
 ) -> Result<String, Box<dyn std::error::Error>> {
+    let retry = retry.max(1);
     let delay = Duration::from_secs(delay);
+    let mut last_error = String::new();
 
-    for attempt in 0..retry {
+    for attempt in 1..=retry {
         match client.get(url).send() {
-            Ok(response) if response.status().is_success() => {
-                return response.text().map_err(Into::into);
+            Ok(response) if response.status().is_success() => match response.text() {
+                Ok(body) => return Ok(body),
+                // The body can time out or break off; that is worth another try.
+                Err(err) => last_error = format!("reading response body failed: {err}"),
+            },
+            Ok(response) if !is_retryable_status(response.status()) => {
+                return Err(format!("Request error: {} ({url})", response.status()).into());
             }
-            Ok(response) if response.status().is_client_error() => {
-                return Err(format!("Client request error: {}", response.status()).into());
-            }
-            Ok(_) if attempt == retry - 1 => {
-                return Err(
-                    format!("Failed to get successful response after {retry} retries").into(),
-                );
-            }
-            Err(err) if attempt == retry - 1 => return Err(err.to_string().into()),
-            _ => std::thread::sleep(delay),
+            Ok(response) => last_error = format!("HTTP {}", response.status()),
+            Err(err) => last_error = err.to_string(),
+        }
+
+        if attempt < retry {
+            std::thread::sleep(delay);
         }
     }
 
-    unreachable!()
+    Err(format!("{url}: no successful response after {retry} attempts: {last_error}").into())
 }
 
 ///////////////////////////////////////////////////////////////////////////////
-///
-/// Unit tests for the ipranges module
-///
+//
+// Unit tests for the ipranges module
+//
 ///////////////////////////////////////////////////////////////////////////////
 
 #[cfg(test)]
@@ -683,7 +762,7 @@ mod tests {
     fn test_to_iprange_separates_ipv4_and_ipv6_prefixes() {
         let response = sample_google_response();
 
-        let (ipv4, ipv6) = to_iprange(&response);
+        let (ipv4, ipv6) = to_iprange(&response).unwrap();
 
         let ipv4nets = ipv4.iter().collect::<Vec<_>>();
         let ipv6nets = ipv6.iter().collect::<Vec<_>>();
@@ -704,7 +783,7 @@ mod tests {
             }],
         };
 
-        let (ipv4, ipv6) = to_iprange(&response);
+        let (ipv4, ipv6) = to_iprange(&response).unwrap();
 
         assert_eq!(ipv4.iter().count(), 0);
         assert_eq!(ipv6.iter().count(), 0);
@@ -748,6 +827,90 @@ mod tests {
         assert_eq!(response.country.as_deref(), Some("United States"));
         assert_eq!(response.continent_code.as_deref(), Some("NA"));
         assert_eq!(response.continent.as_deref(), Some("North America"));
+    }
+
+    #[test]
+    fn test_to_iprange_rejects_invalid_prefix() {
+        let response = GoogleIpRangeResponse {
+            prefixes: vec![Prefix {
+                ipv4_prefix: Some("not-a-cidr".to_string()),
+                ipv6_prefix: None,
+            }],
+        };
+
+        assert!(to_iprange(&response).is_err());
+    }
+
+    #[test]
+    fn test_aggregate_ipnets_merges_and_sorts() {
+        let nets: Vec<IpNet> = vec![
+            "2001:db8::/33".parse().unwrap(),
+            "198.51.100.0/24".parse().unwrap(),
+            "192.0.2.128/25".parse().unwrap(),
+            "192.0.2.0/25".parse().unwrap(),
+            "2001:db8:8000::/33".parse().unwrap(),
+        ];
+
+        let result = aggregate_ipnets(nets);
+
+        let expected: Vec<IpNet> = vec![
+            "192.0.2.0/24".parse().unwrap(),
+            "198.51.100.0/24".parse().unwrap(),
+            "2001:db8::/32".parse().unwrap(),
+        ];
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_canonical_asn() {
+        assert_eq!(canonical_asn("AS15169").unwrap(), "AS15169");
+        assert_eq!(canonical_asn("as15169").unwrap(), "AS15169");
+        assert_eq!(canonical_asn(" 15169 ").unwrap(), "AS15169");
+        assert!(canonical_asn("").is_err());
+        assert!(canonical_asn("AS").is_err());
+        assert!(canonical_asn("AS+1").is_err());
+        assert!(canonical_asn("AS1/../x").is_err());
+        assert!(canonical_asn("99999999999").is_err());
+    }
+
+    #[test]
+    fn test_company_search_url_encodes_name() {
+        let url = company_search_url(" AT&T #1 ").unwrap();
+        assert_eq!(
+            url.as_str(),
+            "https://bgp.he.net/search?search%5Bsearch%5D=AT%26T+%231&commit=Search"
+        );
+        assert!(company_search_url("   ").is_err());
+    }
+
+    #[test]
+    fn test_unique_as_numbers_filters_and_dedups() {
+        let entries = ["AS13414", "1.2.3.0/24", "AS62041", "AS13414", "ASX", "AS"]
+            .map(String::from)
+            .to_vec();
+
+        assert_eq!(unique_as_numbers(entries), vec!["AS13414", "AS62041"]);
+    }
+
+    #[test]
+    fn test_extract_texts_reads_table_links() {
+        let html = r#"<table>
+            <tr><td><a href="/AS62041">AS62041</a></td><td>Telegram</td></tr>
+            <tr><td><a href="/net/91.108.4.0/22"> <b>91.108.4.0/22</b> </a></td></tr>
+            <tr><td><a href="/x"></a></td></tr>
+        </table>
+        <a href="/AS1">AS1</a>"#;
+
+        assert_eq!(
+            extract_texts(html, &TABLE_LINK_SELECTOR),
+            vec!["AS62041", "91.108.4.0/22"]
+        );
+    }
+
+    #[test]
+    fn test_lookup_ipinfo_rejects_invalid_ip() {
+        let err = lookup_ipinfo("not-an-ip").unwrap_err();
+        assert!(err.to_string().contains("not a valid"));
     }
 
     #[test]
